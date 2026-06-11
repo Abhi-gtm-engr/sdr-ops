@@ -1,0 +1,10 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+logs/*.json
+outputs/*.csv
+data/aec_firms.csv
+.DS_Store
+.streamlit/secrets.toml

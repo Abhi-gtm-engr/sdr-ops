@@ -1,0 +1,7 @@
+streamlit
+requests
+python-dotenv
+pandas
+python-dateutil
+tabulate
+slack-bolt

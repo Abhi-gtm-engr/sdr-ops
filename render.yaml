@@ -1,0 +1,53 @@
+services:
+  - type: worker
+    name: sdr-ops-slack-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m workflows.slack_kpi_bot
+    autoDeploy: true
+    envVars:
+      - key: HUBSPOT_API_KEY
+        sync: false
+      - key: APOLLO_API_KEY
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_APP_TOKEN
+        sync: false
+      - key: SLACK_KPI_CHANNEL
+        sync: false
+      - key: SLACK_PROSPECTS_CHANNEL
+        sync: false
+      - key: SDR_USERS_JSON
+        sync: false
+      - key: APOLLO_CONNECTED_OUTCOME_IDS
+        sync: false
+      - key: HUBSPOT_CONNECTED_DISPOSITION_IDS
+        value: f240bbac-87c9-4f6e-bf70-924b57d47db7
+      - key: DEDUP_POST_TO_SLACK
+        value: "false"
+
+  - type: cron
+    name: sdr-ops-kpi-weekly
+    env: python
+    schedule: "0 13 * * 1"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m workflows.kpi_report
+    envVars:
+      - key: HUBSPOT_API_KEY
+        sync: false
+      - key: APOLLO_API_KEY
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_KPI_CHANNEL
+        sync: false
+      - key: SDR_USERS_JSON
+        sync: false
+      - key: APOLLO_CONNECTED_OUTCOME_IDS
+        sync: false
+      - key: HUBSPOT_CONNECTED_DISPOSITION_IDS
+        value: f240bbac-87c9-4f6e-bf70-924b57d47db7
+      - key: DEDUP_POST_TO_SLACK
+        value: "false"
