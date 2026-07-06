@@ -2,8 +2,9 @@ name: Weekly SDR KPI Report
 
 on:
   schedule:
-    # Mondays 13:00 UTC (~08:00 CT / 06:00 PT) — rolling last 7 days.
-    - cron: '0 13 * * 1'
+    # Mondays 15:00 UTC = 8:00 AM PDT (Pacific daylight). Fixed UTC: during PST
+    # winter this lands at 7:00 AM PST. Rolling last 7 days.
+    - cron: '0 15 * * 1'
   workflow_dispatch: {}
 
 jobs:
