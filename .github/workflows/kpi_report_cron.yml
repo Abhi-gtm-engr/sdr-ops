@@ -1,0 +1,29 @@
+name: Weekly SDR KPI Report
+
+on:
+  schedule:
+    # Mondays 13:00 UTC (~08:00 CT / 06:00 PT) — rolling last 7 days.
+    - cron: '0 13 * * 1'
+  workflow_dispatch: {}
+
+jobs:
+  kpi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
+      APOLLO_CONNECTED_OUTCOME_IDS: ${{ secrets.APOLLO_CONNECTED_OUTCOME_IDS }}
+      HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+      SDR_USERS_JSON: ${{ secrets.SDR_USERS_JSON }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_KPI_CHANNEL: ${{ secrets.SLACK_KPI_CHANNEL }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run weekly SDR KPI report
+        run: python workflows/kpi_report.py
