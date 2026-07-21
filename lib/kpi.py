@@ -18,8 +18,19 @@ def get_sdr_users() -> dict:
         return {}
 
 
+# Apollo "connected" outcomes = the SDR reached and had a live conversation with a
+# person. Verified 2026-07-21 from call notes: 805845/846/847 are real conversations
+# ("tt <name>…"), whereas the previously-counted 805840 (voicemail / "gk to vm") and
+# 805842 (gatekeeper — "gk went and checked, she wasn't available") are NOT connects.
+# NOTE: prod injects APOLLO_CONNECTED_OUTCOME_IDS from a GH secret which OVERRIDES this
+# default — update that secret to the corrected value for the fix to take effect live.
+DEFAULT_APOLLO_CONNECTED_OUTCOME_IDS = (
+    "5ef42fb20c815e008c805845,5ef42fb20c815e008c805846,5ef42fb20c815e008c805847"
+)
+
+
 def get_connected_apollo_outcome_ids() -> set:
-    raw = os.getenv("APOLLO_CONNECTED_OUTCOME_IDS", "")
+    raw = os.getenv("APOLLO_CONNECTED_OUTCOME_IDS", DEFAULT_APOLLO_CONNECTED_OUTCOME_IDS)
     return {part.strip() for part in raw.split(",") if part.strip()}
 
 
@@ -140,6 +151,53 @@ def is_apollo_connected_call(call: dict) -> bool:
     return outcome_id in get_connected_apollo_outcome_ids()
 
 
+def get_connect_min_duration() -> int:
+    """A real connect must be a live conversation of at least this many seconds.
+    Filters out voicemails and quick gatekeeper brush-offs that get logged under a
+    'connected' disposition. Set CONNECT_MIN_DURATION_SECONDS=0 to disable."""
+    try:
+        return int(os.getenv("CONNECT_MIN_DURATION_SECONDS", "30"))
+    except (TypeError, ValueError):
+        return 30
+
+
+def _hs_call_seconds(call: dict) -> float:
+    try:
+        return float(call.get("properties", {}).get("hs_call_duration") or 0) / 1000.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apollo_call_seconds(call: dict) -> float:
+    for key in ("duration", "call_duration", "duration_seconds"):
+        val = call.get(key)
+        if val not in (None, ""):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def is_quality_connect(hs_call: dict | None = None, apollo_call: dict | None = None) -> bool:
+    """True only if a call is BOTH dispositioned connected AND a genuine live
+    conversation: meets the minimum-duration floor and is not a dropped voicemail.
+    Guards against the connect rate counting voicemails / gatekeeper-to-VM."""
+    connected = (hs_call is not None and is_hubspot_connected_call(hs_call)) or (
+        apollo_call is not None and is_apollo_connected_call(apollo_call)
+    )
+    if not connected:
+        return False
+    if apollo_call is not None and apollo_call.get("voicemail_dropped"):
+        return False
+    floor = get_connect_min_duration()
+    if floor <= 0:
+        return True
+    seconds = max(_hs_call_seconds(hs_call) if hs_call else 0.0,
+                  _apollo_call_seconds(apollo_call) if apollo_call else 0.0)
+    return seconds >= floor
+
+
 def format_week_range(start_dt: datetime, end_dt: datetime) -> str:
     return f"{start_dt.strftime('%b %d')} – {end_dt.strftime('%b %d, %Y')}"
 
@@ -226,15 +284,18 @@ def collect_sdr_metrics(name: str, ids: dict, start_dt: datetime, end_dt: dateti
     connected_matches = sum(
         1
         for hs_call, apollo_call in call_match["matches"]
-        if is_hubspot_connected_call(hs_call) or is_apollo_connected_call(apollo_call)
+        if is_quality_connect(hs_call, apollo_call)
     )
-    connected_unmatched_hs = sum(1 for hs_call in call_match["unmatched_hs"] if is_hubspot_connected_call(hs_call))
-    connected_unmatched_apollo = sum(1 for apollo_call in call_match["unmatched_apollo"] if is_apollo_connected_call(apollo_call))
+    connected_unmatched_hs = sum(1 for hs_call in call_match["unmatched_hs"] if is_quality_connect(hs_call=hs_call))
+    connected_unmatched_apollo = sum(1 for apollo_call in call_match["unmatched_apollo"] if is_quality_connect(apollo_call=apollo_call))
     connected_total = connected_matches + connected_unmatched_hs + connected_unmatched_apollo
     if connected_total > 0 or m["calls_logged"] > 0:
         m["connected_calls"] = connected_total
         m["connect_rate"] = round(m["connected_calls"] / m["calls_logged"], 3) if m["calls_logged"] else 0
-        m["notes"].append("Connect rate uses HubSpot connected dispositions when present, Apollo mapping as fallback")
+        floor = get_connect_min_duration()
+        m["notes"].append(
+            f"Connect = connected disposition AND live conversation ≥{floor}s (excludes voicemails / gatekeeper-to-VM)"
+        )
 
     m["emails_sent"] = m["emails_sent_hs"]
     m["opens"] = m["opens_apollo"]
