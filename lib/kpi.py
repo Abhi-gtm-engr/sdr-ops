@@ -31,13 +31,20 @@ DEFAULT_APOLLO_CONNECTED_OUTCOME_IDS = (
 
 
 def get_connected_apollo_outcome_ids() -> set:
-    raw = os.getenv("APOLLO_CONNECTED_OUTCOME_IDS", DEFAULT_APOLLO_CONNECTED_OUTCOME_IDS)
-    return {part.strip() for part in raw.split(",") if part.strip()}
+    # NB: the workflow always injects this env var from a GitHub secret, so when the
+    # secret is absent the var is set to "" rather than unset -- os.getenv(name, default)
+    # would then return "" and yield an EMPTY connected set (every connect rate 0%).
+    # Treat empty/whitespace as "not configured" and fall back to the verified default.
+    raw = os.getenv("APOLLO_CONNECTED_OUTCOME_IDS") or DEFAULT_APOLLO_CONNECTED_OUTCOME_IDS
+    ids = {part.strip() for part in raw.split(",") if part.strip()}
+    return ids or {part.strip() for part in DEFAULT_APOLLO_CONNECTED_OUTCOME_IDS.split(",") if part.strip()}
 
 
 def get_connected_hubspot_disposition_ids() -> set:
-    raw = os.getenv("HUBSPOT_CONNECTED_DISPOSITION_IDS", "f240bbac-87c9-4f6e-bf70-924b57d47db7")
-    return {part.strip() for part in raw.split(",") if part.strip()}
+    default = "f240bbac-87c9-4f6e-bf70-924b57d47db7"
+    raw = os.getenv("HUBSPOT_CONNECTED_DISPOSITION_IDS") or default
+    ids = {part.strip() for part in raw.split(",") if part.strip()}
+    return ids or {default}
 
 
 def parse_hs_timestamp(call_record: dict):
