@@ -47,8 +47,17 @@ def search_engagements_by_owner(
     days_back: int = 7,
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
+    date_property: Optional[str] = None,
 ) -> List[Dict]:
-    """Search HubSpot engagements for a specific owner in the last N days."""
+    """Search HubSpot engagements for a specific owner in the last N days.
+
+    date_property selects which date the window applies to. Defaults to
+    hs_timestamp (when the engagement occurred). For MEETING the caller should
+    pass hs_createdate, because hs_timestamp is the meeting's SCHEDULED start
+    time -- windowing on it drops meetings booked this week for a future date
+    and miscredits meetings booked earlier that merely occur this week.
+    """
+    date_property = date_property or "hs_timestamp"
     if end_dt is None:
         end_dt = datetime.now(timezone.utc)
     if start_dt is None:
@@ -74,6 +83,7 @@ def search_engagements_by_owner(
             "hs_meeting_title",
             "hs_meeting_outcome",
             "hs_timestamp",
+            "hs_createdate",
             "hubspot_owner_id",
         ],
         "CALL": [
@@ -100,9 +110,14 @@ def search_engagements_by_owner(
                             "value": owner_id,
                         },
                         {
-                            "propertyName": "hs_timestamp",
+                            "propertyName": date_property,
                             "operator": "GTE",
                             "value": str(since_ms),
+                        },
+                        {
+                            "propertyName": date_property,
+                            "operator": "LTE",
+                            "value": str(until_ms),
                         },
                     ]
                 }
@@ -115,7 +130,7 @@ def search_engagements_by_owner(
 
         data = _post_with_retry(url, body)
         for record in data.get("results", []):
-            ts_raw = record.get("properties", {}).get("hs_timestamp")
+            ts_raw = record.get("properties", {}).get(date_property)
             if not ts_raw:
                 results.append(record)
                 continue

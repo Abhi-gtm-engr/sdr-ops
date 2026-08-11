@@ -1,5 +1,6 @@
 """Reusable KPI helpers for scheduled jobs and on-demand Slack queries."""
 import json
+import re
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -107,30 +108,78 @@ def match_call_records(hs_calls: list, apollo_calls: list, window_seconds: int =
     }
 
 
+_MEETING_STATUS_SUFFIX = re.compile(
+    r"\s*[-\u2013]\s*meeting\s+(canceled|cancelled|rescheduled|no[\s-]?show|updated)\s*$"
+)
+
+
 def normalize_meeting_title(title: str) -> str:
     title = (title or "").strip()
     if title.lower().startswith("[gong]"):
         title = title[6:].strip()
-    return " ".join(title.split()).lower()
+    title = " ".join(title.split()).lower()
+    # Gong writes a second record with a status suffix appended; without stripping
+    # it the same meeting dedupes to two distinct keys and is counted twice.
+    return _MEETING_STATUS_SUFFIX.sub("", title).strip()
+
+
+def _meeting_created_dt(meeting: dict):
+    raw = (meeting.get("properties", {}) or {}).get("hs_createdate")
+    if not raw:
+        return None
+    txt = str(raw).strip()
+    try:
+        if "T" in txt or "-" in txt:
+            return datetime.fromisoformat(txt.replace("Z", "+00:00"))
+        return datetime.fromtimestamp(int(txt) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+# Gong mirrors a booking into a second record within minutes; a genuine second
+# meeting with the same company is booked hours or days apart.
+GONG_MIRROR_WINDOW_SECONDS = 6 * 3600
 
 
 def dedupe_hubspot_meetings(meetings: list[dict]) -> list[dict]:
-    grouped = {}
+    """Collapse Gong's mirror records without merging distinct bookings.
+
+    Keyed on normalized title, then clustered by creation time: records sharing a
+    title created within GONG_MIRROR_WINDOW_SECONDS are one booking. Keying on
+    hs_timestamp instead would split a rescheduled meeting in two (the mirror can
+    carry a different scheduled time), and keying on title alone would merge two
+    real meetings booked with the same account in one week.
+    """
+    buckets: dict[str, list[dict]] = {}
     for meeting in meetings:
-        props = meeting.get("properties", {})
-        ts = props.get("hs_timestamp") or ""
-        title = props.get("hs_meeting_title") or ""
-        key = (ts, normalize_meeting_title(title))
-        existing = grouped.get(key)
-        if existing is None:
-            grouped[key] = meeting
-            continue
-        existing_title = (existing.get("properties", {}).get("hs_meeting_title") or "").strip()
-        current_is_gong = title.strip().lower().startswith("[gong]")
-        existing_is_gong = existing_title.lower().startswith("[gong]")
-        if existing_is_gong and not current_is_gong:
-            grouped[key] = meeting
-    return list(grouped.values())
+        props = meeting.get("properties", {}) or {}
+        key = normalize_meeting_title(props.get("hs_meeting_title") or "")
+        buckets.setdefault(key, []).append(meeting)
+
+    kept = []
+    for _key, group in buckets.items():
+        group.sort(key=lambda m: _meeting_created_dt(m) or datetime.min.replace(tzinfo=timezone.utc))
+        clusters: list[list[dict]] = []
+        for meeting in group:
+            created = _meeting_created_dt(meeting)
+            placed = False
+            for cluster in clusters:
+                anchor = _meeting_created_dt(cluster[0])
+                if created is None or anchor is None:
+                    cluster.append(meeting); placed = True; break
+                if abs((created - anchor).total_seconds()) <= GONG_MIRROR_WINDOW_SECONDS:
+                    cluster.append(meeting); placed = True; break
+            if not placed:
+                clusters.append([meeting])
+        for cluster in clusters:
+            # prefer the non-Gong record as the representative
+            rep = next(
+                (m for m in cluster
+                 if not (m.get("properties", {}).get("hs_meeting_title") or "").strip().lower().startswith("[gong]")),
+                cluster[0],
+            )
+            kept.append(rep)
+    return kept
 
 
 def is_hubspot_connected_call(call: dict) -> bool:
@@ -244,7 +293,10 @@ def collect_sdr_metrics(name: str, ids: dict, start_dt: datetime, end_dt: dateti
             m["notes"].append(f"HubSpot calls error: {e}")
 
         try:
-            meetings = hubspot.search_engagements_by_owner(hubspot_owner_id, "MEETING", start_dt=start_dt, end_dt=end_dt)
+            meetings = hubspot.search_engagements_by_owner(
+                hubspot_owner_id, "MEETING", start_dt=start_dt, end_dt=end_dt,
+                date_property="hs_createdate",
+            )
             deduped_meetings = dedupe_hubspot_meetings(meetings)
             agg = hubspot.aggregate_meeting_metrics(deduped_meetings)
             m["meetings_hs"] = agg["meetings_booked"]
