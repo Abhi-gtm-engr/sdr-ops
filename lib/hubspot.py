@@ -156,6 +156,83 @@ def search_engagements_by_owner(
     return results
 
 
+def search_meetings_booked_by(
+    creator_user_id: str,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    days_back: int = 7,
+) -> List[Dict]:
+    """Meetings an SDR personally booked, windowed on when they booked it.
+
+    Attribution is on hs_created_by (the user who created the meeting record),
+    NOT hubspot_owner_id, for two reasons found in the Aug 03-10 data:
+
+    1. An SDR-booked demo is frequently owned by the AE who will run it -- Quinn
+       booked "Infra Map | Kantiv-Demo" but it is owned by 163644510, so an
+       owner-keyed query never saw it.
+    2. Gong mirrors every booking into a second record with hs_created_by unset.
+       Filtering on the creator drops those mirrors outright, so the fragile
+       title-similarity dedupe is no longer load-bearing. That dedupe was still
+       double-counting: Gong writes the cancel mirror as "Cancelled: <title>",
+       and the leading prefix produced a second bucket.
+    """
+    if end_dt is None:
+        end_dt = datetime.now(timezone.utc)
+    if start_dt is None:
+        start_dt = end_dt - timedelta(days=days_back)
+
+    since_ms = int(start_dt.timestamp() * 1000)
+    until_ms = int(end_dt.timestamp() * 1000)
+
+    url = f"{BASE}/crm/v3/objects/meetings/search"
+    results = []
+    after = None
+    while True:
+        body = {
+            "filterGroups": [
+                {
+                    "filters": [
+                        {
+                            "propertyName": "hs_created_by",
+                            "operator": "EQ",
+                            "value": str(creator_user_id),
+                        },
+                        {
+                            "propertyName": "hs_createdate",
+                            "operator": "GTE",
+                            "value": str(since_ms),
+                        },
+                        {
+                            "propertyName": "hs_createdate",
+                            "operator": "LTE",
+                            "value": str(until_ms),
+                        },
+                    ]
+                }
+            ],
+            "properties": [
+                "hs_meeting_title",
+                "hs_meeting_outcome",
+                "hs_timestamp",
+                "hs_createdate",
+                "hubspot_owner_id",
+                "hs_created_by",
+            ],
+            "limit": 100,
+        }
+        if after:
+            body["after"] = after
+
+        data = _post_with_retry(url, body)
+        results.extend(data.get("results", []))
+        after = data.get("paging", {}).get("next", {}).get("after")
+        if not after:
+            break
+
+    # Same object id can come back across pages only on concurrent writes; keep it cheap.
+    return list({m["id"]: m for m in results}.values())
+
+
 def aggregate_email_metrics(emails: List[Dict]) -> Dict:
     """Aggregate raw email engagements into metrics.
 

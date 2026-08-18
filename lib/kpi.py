@@ -1,6 +1,5 @@
 """Reusable KPI helpers for scheduled jobs and on-demand Slack queries."""
 import json
-import re
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,13 +19,28 @@ def get_sdr_users() -> dict:
 
 
 # Apollo "connected" outcomes = the SDR reached and had a live conversation with a
-# person. Verified 2026-07-21 from call notes: 805845/846/847 are real conversations
-# ("tt <name>…"), whereas the previously-counted 805840 (voicemail / "gk to vm") and
-# 805842 (gatekeeper — "gk went and checked, she wasn't available") are NOT connects.
+# person. Re-verified 2026-08-18 against 30 days of call notes and durations:
+#
+#   ...805845  n=10  median 157s  real conversations ("interested, asked for an email")
+#   ...805846  n=10  median  68s  real conversations ("not interested", "not the DM")
+#   ...805847  n=17  median  62s  real conversations ("already demoed with us")
+#   692f1d54…  n=12  median 258s  real conversations, several ending in a booking
+#                                 ("meeting booked for a week and half from now").
+#                                 A custom outcome added later; it was never in the
+#                                 connected set, so these were undercounted.
+#   ...805840  n=139 median  50s  gatekeeper-to-voicemail ("gk to vm")   -> NOT a connect
+#   ...805842  n=6   median  66s  gatekeeper ("she wasn't available")    -> NOT a connect
+#   ...80583f  n=570 median   8s  no answer / voicemail ("leave VM #1")  -> NOT a connect
+#   ...805841  n=6   median  30s  reached them but bad timing ("in a meeting, call back").
+#                                 Excluded: reaching someone who cannot talk is not a
+#                                 conversation. Flip it by adding the id here (+~1pt).
+#
 # NOTE: prod injects APOLLO_CONNECTED_OUTCOME_IDS from a GH secret which OVERRIDES this
-# default — update that secret to the corrected value for the fix to take effect live.
+# default. That secret does not currently exist, so the workflow passes "" and the
+# fallback below applies -- do not recreate it with a stale value.
 DEFAULT_APOLLO_CONNECTED_OUTCOME_IDS = (
-    "5ef42fb20c815e008c805845,5ef42fb20c815e008c805846,5ef42fb20c815e008c805847"
+    "5ef42fb20c815e008c805845,5ef42fb20c815e008c805846,5ef42fb20c815e008c805847,"
+    "692f1d548a0f320011f18079"
 )
 
 
@@ -75,17 +89,45 @@ def parse_apollo_timestamp(call: dict):
 
 
 def match_call_records(hs_calls: list, apollo_calls: list, window_seconds: int = 120):
+    """Pair each Apollo dial with its HubSpot twin so one real call counts once.
+
+    Apollo stamps the HubSpot call object id it logged into onto the call record
+    (`hubspot_id`), so that is an exact join and is tried first. The ±120s
+    nearest-neighbour fallback below only runs for records without one.
+
+    The timestamp heuristic alone was badly under-pairing: SDRs power-dial, so
+    several dials share a 2-minute bucket and the greedy nearest-neighbour
+    claimed the wrong HubSpot record. Over Aug 03-10 it paired 60 of Quinn's 77
+    joinable calls, inflating his call volume to 96 against 79 real calls -- and
+    a connected conversation that failed to pair was counted twice, once as an
+    unmatched HubSpot call and again as an unmatched Apollo call.
+    """
+    hs_by_id = {str(call.get("id")): call for call in hs_calls if call.get("id") is not None}
+
+    matched_hs_ids = set()
+    matches = []
+    remaining_apollo = []
+    for apollo_call in apollo_calls:
+        hubspot_id = apollo_call.get("hubspot_id")
+        twin = hs_by_id.get(str(hubspot_id)) if hubspot_id else None
+        if twin is not None and str(hubspot_id) not in matched_hs_ids:
+            matched_hs_ids.add(str(hubspot_id))
+            matches.append((twin, apollo_call))
+        else:
+            remaining_apollo.append(apollo_call)
+
     hs_with_times = []
     for call in hs_calls:
+        if str(call.get("id")) in matched_hs_ids:
+            continue
         ts = parse_hs_timestamp(call)
         if ts is not None:
             hs_with_times.append((call, ts))
 
     matched_hs_indices = set()
-    matches = []
     unmatched_apollo = []
 
-    for apollo_call in apollo_calls:
+    for apollo_call in remaining_apollo:
         apollo_ts = parse_apollo_timestamp(apollo_call)
         if apollo_ts is None:
             unmatched_apollo.append(apollo_call)
@@ -107,7 +149,14 @@ def match_call_records(hs_calls: list, apollo_calls: list, window_seconds: int =
             matched_hs_indices.add(best_idx)
             matches.append((hs_with_times[best_idx][0], apollo_call))
 
-    unmatched_hs = [call for idx, (call, _) in enumerate(hs_with_times) if idx not in matched_hs_indices]
+    for idx, (call, _) in enumerate(hs_with_times):
+        if idx in matched_hs_indices:
+            matched_hs_ids.add(str(call.get("id")))
+
+    # Derived from the full list, not from hs_with_times: a HubSpot call whose
+    # timestamp will not parse is still a call the SDR logged, and building this
+    # off the parseable subset dropped it from calls_logged entirely.
+    unmatched_hs = [call for call in hs_calls if str(call.get("id")) not in matched_hs_ids]
     return {
         "matches": matches,
         "unmatched_hs": unmatched_hs,
@@ -115,91 +164,18 @@ def match_call_records(hs_calls: list, apollo_calls: list, window_seconds: int =
     }
 
 
-_MEETING_STATUS_SUFFIX = re.compile(
-    r"\s*[-\u2013]\s*meeting\s+(canceled|cancelled|rescheduled|no[\s-]?show|updated)\s*$"
-)
-
-
-def normalize_meeting_title(title: str) -> str:
-    title = (title or "").strip()
-    if title.lower().startswith("[gong]"):
-        title = title[6:].strip()
-    title = " ".join(title.split()).lower()
-    # Gong writes a second record with a status suffix appended; without stripping
-    # it the same meeting dedupes to two distinct keys and is counted twice.
-    return _MEETING_STATUS_SUFFIX.sub("", title).strip()
-
-
-def _meeting_created_dt(meeting: dict):
-    raw = (meeting.get("properties", {}) or {}).get("hs_createdate")
-    if not raw:
-        return None
-    txt = str(raw).strip()
-    try:
-        if "T" in txt or "-" in txt:
-            return datetime.fromisoformat(txt.replace("Z", "+00:00"))
-        return datetime.fromtimestamp(int(txt) / 1000, tz=timezone.utc)
-    except (TypeError, ValueError):
-        return None
-
-
-# Gong mirrors a booking into a second record within minutes; a genuine second
-# meeting with the same company is booked hours or days apart.
-GONG_MIRROR_WINDOW_SECONDS = 6 * 3600
-
-
-def dedupe_hubspot_meetings(meetings: list[dict]) -> list[dict]:
-    """Collapse Gong's mirror records without merging distinct bookings.
-
-    Keyed on normalized title, then clustered by creation time: records sharing a
-    title created within GONG_MIRROR_WINDOW_SECONDS are one booking. Keying on
-    hs_timestamp instead would split a rescheduled meeting in two (the mirror can
-    carry a different scheduled time), and keying on title alone would merge two
-    real meetings booked with the same account in one week.
-    """
-    buckets: dict[str, list[dict]] = {}
-    for meeting in meetings:
-        props = meeting.get("properties", {}) or {}
-        key = normalize_meeting_title(props.get("hs_meeting_title") or "")
-        buckets.setdefault(key, []).append(meeting)
-
-    kept = []
-    for _key, group in buckets.items():
-        group.sort(key=lambda m: _meeting_created_dt(m) or datetime.min.replace(tzinfo=timezone.utc))
-        clusters: list[list[dict]] = []
-        for meeting in group:
-            created = _meeting_created_dt(meeting)
-            placed = False
-            for cluster in clusters:
-                anchor = _meeting_created_dt(cluster[0])
-                if created is None or anchor is None:
-                    cluster.append(meeting); placed = True; break
-                if abs((created - anchor).total_seconds()) <= GONG_MIRROR_WINDOW_SECONDS:
-                    cluster.append(meeting); placed = True; break
-            if not placed:
-                clusters.append([meeting])
-        for cluster in clusters:
-            # prefer the non-Gong record as the representative
-            rep = next(
-                (m for m in cluster
-                 if not (m.get("properties", {}).get("hs_meeting_title") or "").strip().lower().startswith("[gong]")),
-                cluster[0],
-            )
-            kept.append(rep)
-    return kept
-
-
 def is_hubspot_connected_call(call: dict) -> bool:
-    props = call.get("properties", {})
-    disposition = (props.get("hs_call_disposition") or "").strip()
-    body = (props.get("hs_call_body") or "").lower()
-    connected_disposition_ids = get_connected_hubspot_disposition_ids()
-    if disposition and disposition in connected_disposition_ids:
-        return True
-    return any(
-        token in body
-        for token in ["connected - positive", "connected - neutral", "connected - negative"]
-    )
+    """Connected = the call carries the portal's "Connected" disposition.
+
+    The 30-day profile confirms that mapping: f240bbac (n=55) runs a 141s median,
+    against 10s for no-answer (73a0d17f) and 58s for left-voicemail (b2cf5968).
+    A free-text hs_call_body fallback used to sit here, but hs_call_body is not
+    among the properties the search requests, so it was always empty and never
+    fired -- keeping it invited a future property change to silently widen the
+    definition by keyword-matching call notes.
+    """
+    disposition = (call.get("properties", {}).get("hs_call_disposition") or "").strip()
+    return bool(disposition) and disposition in get_connected_hubspot_disposition_ids()
 
 
 def is_apollo_connected_call(call: dict) -> bool:
@@ -208,13 +184,20 @@ def is_apollo_connected_call(call: dict) -> bool:
 
 
 def get_connect_min_duration() -> int:
-    """A real connect must be a live conversation of at least this many seconds.
-    Filters out voicemails and quick gatekeeper brush-offs that get logged under a
-    'connected' disposition. Set CONNECT_MIN_DURATION_SECONDS=0 to disable."""
+    """Optional minimum call length for a connect. Defaults to OFF.
+
+    This was introduced as a proxy for "not a voicemail" and set to 30s, but the
+    30-day duration profile says it never did that job: voicemail outcomes run a
+    median of 50-58s (you talk while leaving one) so 89-92% of them clear a 30s
+    bar, while 6 of 55 genuinely connected HubSpot calls fall under it and were
+    silently dropped. Voicemail and gatekeeper calls are excluded by outcome id,
+    which is exact; the floor only cost real connects. Set
+    CONNECT_MIN_DURATION_SECONDS to re-enable it.
+    """
     try:
-        return int(os.getenv("CONNECT_MIN_DURATION_SECONDS", "30"))
+        return int(os.getenv("CONNECT_MIN_DURATION_SECONDS", "0"))
     except (TypeError, ValueError):
-        return 30
+        return 0
 
 
 def _hs_call_seconds(call: dict) -> float:
@@ -278,6 +261,7 @@ def collect_sdr_metrics(name: str, ids: dict, start_dt: datetime, end_dt: dateti
         "connect_rate": None,
         "meetings_hs": 0,
         "meetings_apollo": 0,
+        "meeting_list": [],
         "notes": [],
     }
     hs_calls = []
@@ -300,16 +284,24 @@ def collect_sdr_metrics(name: str, ids: dict, start_dt: datetime, end_dt: dateti
             m["notes"].append(f"HubSpot calls error: {e}")
 
         try:
-            meetings = hubspot.search_engagements_by_owner(
-                hubspot_owner_id, "MEETING", start_dt=start_dt, end_dt=end_dt,
-                date_property="hs_createdate",
+            meetings = hubspot.search_meetings_booked_by(
+                hubspot_owner_id, start_dt=start_dt, end_dt=end_dt
             )
-            deduped_meetings = dedupe_hubspot_meetings(meetings)
-            agg = hubspot.aggregate_meeting_metrics(deduped_meetings)
+            agg = hubspot.aggregate_meeting_metrics(meetings)
             m["meetings_hs"] = agg["meetings_booked"]
-            removed = len(meetings) - len(deduped_meetings)
-            if removed > 0:
-                m["notes"].append(f"Meeting duplicates removed: {removed}")
+            # Itemised so anyone disputing the number can reconcile it directly
+            # instead of re-litigating the count in a Slack thread.
+            m["meeting_list"] = [
+                {
+                    "title": (mt.get("properties", {}).get("hs_meeting_title") or "").strip(),
+                    "booked_at": (mt.get("properties", {}).get("hs_createdate") or ""),
+                    "scheduled_for": (mt.get("properties", {}).get("hs_timestamp") or ""),
+                    "outcome": (mt.get("properties", {}).get("hs_meeting_outcome") or ""),
+                }
+                for mt in sorted(
+                    meetings, key=lambda x: x.get("properties", {}).get("hs_createdate") or ""
+                )
+            ]
         except Exception as e:
             m["notes"].append(f"HubSpot meetings error: {e}")
     else:
@@ -352,9 +344,10 @@ def collect_sdr_metrics(name: str, ids: dict, start_dt: datetime, end_dt: dateti
         m["connected_calls"] = connected_total
         m["connect_rate"] = round(m["connected_calls"] / m["calls_logged"], 3) if m["calls_logged"] else 0
         floor = get_connect_min_duration()
-        m["notes"].append(
-            f"Connect = connected disposition AND live conversation ≥{floor}s (excludes voicemails / gatekeeper-to-VM)"
-        )
+        note = "Connect = live conversation (excludes no-answer, voicemail, gatekeeper)"
+        if floor > 0:
+            note += f", minimum {floor}s"
+        m["notes"].append(note)
 
     m["emails_sent"] = m["emails_sent_hs"]
     m["opens"] = m["opens_apollo"]

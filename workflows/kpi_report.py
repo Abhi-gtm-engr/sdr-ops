@@ -62,6 +62,18 @@ def main():
         run["output_files"].append(str(csv_path))
         print(f"[kpi_report] Wrote CSV: {csv_path}")
 
+        # Itemised meetings alongside the counts. When an SDR says "I booked 5,
+        # not 2", this is the artefact that settles it without a re-run.
+        meetings_path = OUTPUTS_DIR / f"kpi_meetings_{ts}.csv"
+        with open(meetings_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["sdr", "booked_at", "scheduled_for", "outcome", "title"])
+            writer.writeheader()
+            for mx in report["per_sdr"].values():
+                for meeting in mx.get("meeting_list", []):
+                    writer.writerow({"sdr": mx["sdr"], **meeting})
+        run["output_files"].append(str(meetings_path))
+        print(f"[kpi_report] Wrote meeting detail: {meetings_path}")
+
         notes = set()
         for mx in report["per_sdr"].values():
             for note in mx.get("notes", []):
